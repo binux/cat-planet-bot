@@ -4,8 +4,6 @@ import datetime
 import multiprocessing
 import sys
 import select
-import tty
-import termios
 import numpy as np
 from multiprocessing import shared_memory
 from operator import itemgetter
@@ -46,7 +44,7 @@ def frame(ns, frame_shm):
         frame_time=now,
     )
     frame_offset += frame_offset + frame.size
-    ns.processing_event_queue.put((frame_seq, 'frame', time.time()))
+    ns.processing_event_queue.put((frame_seq, now, 'frame', now))
     ns.frame_event.set()
     ns.frame_event.clear()
     if ns.reset_windows_pos:
@@ -85,7 +83,7 @@ def classifier(ns, frame_shm):
         frame_seq=frame_seq,
         frame_time=frame_time,
     )
-    ns.processing_event_queue.put((frame_seq, 'classifier', time.time()))
+    ns.processing_event_queue.put((frame_seq, frame_time, 'classifier', time.time()))
     ns.classifier_event.set()
     ns.classifier_event.clear()
     time.sleep(0.3)
@@ -128,19 +126,20 @@ def detector(ns, frame_shm, debug=False):
     fish_drag_anchor_deg = None
     if ui_type == 'fish_drag':
       fish_drag_anchor_deg = anchor_detector.detect(frame)
+    fish_cast_ring_target_radius = None
     fish_cast_ring_radius = None
     if ui_type == 'fish_ring':
-      fish_cast_ring_radius = cast_ring_detector.detect(frame)
+      fish_cast_ring_target_radius, fish_cast_ring_radius = cast_ring_detector.detect(frame)
 
     ns.detector_data = dict(
         fish_cast_ring_radius=fish_cast_ring_radius,
-        fish_cast_ring_target_radius=cast_ring_detector.target_radius,
+        fish_cast_ring_target_radius=fish_cast_ring_target_radius,
         fish_drag_anchor_deg=fish_drag_anchor_deg,
         fish_drag_target_deg=anchor_detector.target_deg,
         frame_seq=frame_seq,
         frame_time=frame_time,
     )
-    ns.processing_event_queue.put((frame_seq, 'detector', time.time()))
+    ns.processing_event_queue.put((frame_seq, frame_time, 'detector', time.time()))
     ns.detector_event.set()
     ns.detector_event.clear()
 
@@ -149,6 +148,7 @@ def bot(ns, frame_shm):
   from state_machine import StateMachine
 
   ns.frame_latency = 0
+  ns.fish_items = None
 
   def get_frame_fn():
     frame_data = ns.frame_data
@@ -158,10 +158,40 @@ def bot(ns, frame_shm):
     ]
     return get_frame(frame_shm, frame_shape, frame_offset)
 
-  state_machine = StateMachine(ns, get_frame=get_frame_fn)
+  sm = StateMachine(ns, get_frame=get_frame_fn)
   ns.classifier_event.wait()
   ns.bot_ready.set()
-  state_machine.run()
+
+  if not ns.detector_data:
+    ns.detector_event.wait()
+  if not ns.classifier_data:
+    ns.classifier_event.wait()
+
+  processed_seq = 0
+  while not ns.quit:
+    # process all pending finger releases
+    sm.finger.autorelease(0)
+    # process all bot command
+    while not ns.bot_command.empty():
+      command, args = ns.bot_command.get_nowait()
+      getattr(sm, command)(*args)
+
+    detector_data = ns.detector_data
+    frame_time = detector_data['frame_time']
+    frame_seq = detector_data['frame_seq']
+    if frame_seq == processed_seq:
+      ns.detector_event.wait(0.1)
+      continue
+    processed_seq = frame_seq
+    sm.detector_data = detector_data
+
+    classifier_data = ns.classifier_data
+    ui_type = classifier_data['ui_type']
+    sm.on_ui_type(frame_time, ui_type)
+
+    ns.processing_event_queue.put((frame_seq, frame_time, 'bot', time.time()))
+
+  sm.finger.all_press_up()
 
 def main(frame_shm, debug=False):
   import cv2 as cv
@@ -235,6 +265,8 @@ def main(frame_shm, debug=False):
                  font_scale,
                  (0, 255, 0),
                  thickness=thickness)
+    cv.namedWindow("OpenCV", cv.WINDOW_NORMAL)
+    cv.resizeWindow("OpenCV", 600, 300)
     cv.imshow("OpenCV", frame)
     key_code = cv.waitKey(1) & 0xFF
     if key_code:
@@ -255,12 +287,14 @@ def main(frame_shm, debug=False):
         fps.get('detector', 0),
         fps.get('bot', 0),
     ))
-    texts.append("latency: %02.0f|%02.0f|%02.0f|%02.0f" % (
+    texts.append("Latency: %02.0f|%02.0f|%02.0f|%02.0f" % (
         ns.frame_latency * 1000 if ns.bot_ready.is_set() else 0,
         latency.get('classifier', 0),
         latency.get('detector', 0),
         latency.get('bot', 0),
     ))
+    if ns.bot_ready.is_set():
+      texts.append("items = %r" % ns.fish_items)
     classifier_data = ns.classifier_data
     if classifier_data:
       texts.append("%s = %03d%%" %
@@ -278,7 +312,8 @@ def main(frame_shm, debug=False):
       fish_cast_ring_target_radius = detector_data['fish_cast_ring_target_radius']
       if fish_cast_ring_radius is not None:
         texts.append("ring:  %+06.1f %05.1f" % (
-            fish_cast_ring_target_radius - fish_cast_ring_radius,
+            fish_cast_ring_target_radius - fish_cast_ring_radius
+            if fish_cast_ring_radius and fish_cast_ring_target_radius else -1,
             fish_cast_ring_radius,
         ))
     update_info_cv(texts)
@@ -287,10 +322,10 @@ def main(frame_shm, debug=False):
   def process_event_queue():
     queue = ns.processing_event_queue
     while not queue.empty():
-      seq, worker, timestamp = queue.get()
+      frame_seq, frame_time, worker, process_time = queue.get()
       if worker not in deques:
         deques[worker] = collections.deque(maxlen=100)
-      deques[worker].append((seq, timestamp))
+      deques[worker].append((process_time, process_time - frame_time))
 
   last_fps = [0, None]
   def get_fps_latency():
@@ -300,31 +335,13 @@ def main(frame_shm, debug=False):
       return last_fps[1]
     fps = {}
     latency = {}
-    best_worker = deques['frame']
     for worker, deque in deques.items():
       if len(deque) <= 1:
         continue
-      # fps
-      fps[worker] = (len(deque) - 1) / (deque[-1][1] - deque[0][1])
-      # latency
-      if deque is not best_worker:
-        it = iter(deque)
-        t_sum = 0
-        t_cnt = 0
-        for s1, t1 in best_worker:
-          for s2, t2 in it:
-            if s2 < s1:
-              continue
-            if s2 == s1:
-              t_sum += t2 - t1
-              t_cnt += 1
-            break
-        if t_cnt:
-          latency[worker] = t_sum * 1000 / t_cnt
-    last_fps[0] = time.time()
-    last_fps[1] = (fps, latency)
+      fps[worker] = (len(deque) - 1) / (deque[-1][0] - deque[0][0])
+      latency[worker] = np.mean([x[1] for x in deque]) * 1000
+    last_fps[:] = [time.time(), (fps, latency)]
     return fps, latency
-
 
   while not ns.quit:
     if isData():

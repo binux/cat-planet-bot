@@ -7,8 +7,12 @@ import cv2 as cv
 import numpy as np
 
 
+
 class ScreenCapture:
   debug_color = (0, 255, 0)
+  frame_size = 1140 * 1546
+  title_hight = 60
+
 
   def __init__(self, window_name='LetsView'):
     self.window_name = window_name

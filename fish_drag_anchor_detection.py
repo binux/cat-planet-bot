@@ -15,7 +15,7 @@ class AnchorDetector:
     self.left_deg = model['left_deg']
     self.right_deg = model['right_deg']
     # self.target_deg = [68.66, 75.79]
-    self.target_deg = 71
+    self.target_deg = 69
 
     start, end = sorted([self.left_deg, self.right_deg])
     step = (end - start) / 100
