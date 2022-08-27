@@ -40,7 +40,7 @@ class FishCastRingDetector:
     img = cv.Canny(img, 50, 200, None, 3)
     distance = np.linalg.norm(np.transpose(np.nonzero(img > 0)) - self.center,
                               axis=1)
-    hist, edge = np.histogram(distance, 10, (60, 320))
+    hist, edge = np.histogram(distance, 10, (60, 300))
     # print(hist, edge)
     if np.max(hist) < 100:
       return

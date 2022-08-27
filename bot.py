@@ -1,27 +1,33 @@
+import argparse
 import collections
 import time
 import datetime
 import multiprocessing
 import sys
-import select
+import logging
 import numpy as np
 from multiprocessing import shared_memory
-from operator import itemgetter
 
-frame_buffer_size = 1140 * 1546 * 3 * 60
+frame_buffer_size = 1140 * 1546 * 3 * 120
 frame_buffer_dtype = np.uint8
+options = None
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(levelname).1s %(asctime)s %(module)s:%(lineno)d] %(message)s')
 
 def get_frame(frame_shm, frame_shape, offset):
   buf = np.frombuffer(frame_shm.buf, frame_buffer_dtype, np.prod(frame_shape),
                       offset)
-  return buf.copy().reshape(frame_shape)
+  return buf.reshape(frame_shape)
 
 def frame(ns, frame_shm):
-  from macos_screen import ScreenCapture
+  # from screen_capture import ScreenCapture
+  from obs_capture import OBSCapture as Capture
 
   ns.reset_windows_pos = False
 
-  screen = ScreenCapture()
+  screen = Capture()
   frame_seq = 0
   frame_offset = 0
   frame_buffer = np.ndarray(frame_buffer_size,
@@ -69,6 +75,8 @@ def classifier(ns, frame_shm):
         frame_data[k]
         for k in 'frame_seq, frame_time, frame_shape, frame_offset'.split(', ')
     ]
+    if frame_seq - processed_seq < 10:
+      continue
     frame = get_frame(frame_shm, frame_shape, frame_offset)
     if frame_seq == processed_seq:
       ns.frame_event.wait(0.1)
@@ -86,12 +94,12 @@ def classifier(ns, frame_shm):
     ns.processing_event_queue.put((frame_seq, frame_time, 'classifier', time.time()))
     ns.classifier_event.set()
     ns.classifier_event.clear()
-    time.sleep(0.3)
 
     # save screenshot
-    if ((ui_type == 'unknown' or score < 50) and ns.save_screenshot
+    if ((ui_type == 'unknown' or score < 70) and ns.save_screenshot
         and time.time() - last_save > 1):
-      filename = 'data/raw/%s.png' % datetime.datetime.now().isoformat()
+      filename = ('data/raw/%s.png' %
+                  datetime.datetime.now().isoformat().replace(':', '.'))
       cv.imwrite(filename, frame)
       last_save = time.time()
 
@@ -145,7 +153,10 @@ def detector(ns, frame_shm, debug=False):
 
 
 def bot(ns, frame_shm):
-  from state_machine import StateMachine
+  if options.script == 'fishing':
+    from fishing_machine import FishingMachine as StateMachine
+  elif options.script == 'graffiti':
+    from graffiti_machine import GraffitiMachine as StateMachine
 
   ns.frame_latency = 0
   ns.fish_items = None
@@ -193,6 +204,15 @@ def bot(ns, frame_shm):
 
   sm.finger.all_press_up()
 
+def get_options():
+  parser = argparse.ArgumentParser(description='Bot launcher.')
+  parser.add_argument('-d', '--debug', help='Debug', action='store_true')
+  parser.add_argument('script',
+                      help='Bot Script',
+                      choices=['fishing', 'graffiti'],
+                      default='graffiti')
+  return parser.parse_args()
+
 def main(frame_shm, debug=False):
   import cv2 as cv
 
@@ -222,9 +242,6 @@ def main(frame_shm, debug=False):
   for p in processes:
     p.start()
 
-  def isData():
-    return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
-
   def on_key_code(c):
     if c == 'q':
       ns.quit = True
@@ -235,15 +252,33 @@ def main(frame_shm, debug=False):
           for k in 'frame_shape, frame_offset'.split(', ')
       ]
       frame = get_frame(frame_shm, frame_shape, frame_offset)
-      filename = 'data/raw/%s.png' % datetime.datetime.now().isoformat()
+      filename = ('data/raw/%s.png' %
+                  datetime.datetime.now().isoformat().replace(':', '-'))
       cv.imwrite(filename, frame)
       ns.save_screenshot = not ns.save_screenshot
     elif c == 'r':
       ns.reset_windows_pos = True
+    elif c == 'k':
+      processes[-1].kill()
+      processes[-1] = multiprocessing.Process(target=bot, args=(ns, frame_shm))
+      processes[-1].start()
+    elif c == 'o':
+      if video_out[0]:
+        video_out[0].release()
+        video_out[0] = None
+      else:
+        frame_shape = ns.frame_data['frame_shape']
+        fourcc = cv.VideoWriter_fourcc(*'XVID')
+        video_out[0] = cv.VideoWriter(
+            'data/video/%s.mp4' %
+            datetime.datetime.now().isoformat().replace(':', '-'), fourcc,
+            30.0, (frame_shape[1], frame_shape[0]))
     elif c == 'p':
       ns.bot_command.put(('toggle_pause', []))
 
+  video_out = [None]
   blank_frame = np.zeros((600, 1200, 3), np.uint8)
+  cv.namedWindow("OpenCV", cv.WINDOW_NORMAL)
   def update_info_cv(texts):
     if debug and ns.frame_data:
       frame_data = ns.frame_data
@@ -265,8 +300,8 @@ def main(frame_shm, debug=False):
                  font_scale,
                  (0, 255, 0),
                  thickness=thickness)
-    cv.namedWindow("OpenCV", cv.WINDOW_NORMAL)
-    cv.resizeWindow("OpenCV", 600, 300)
+    if video_out[0]:
+      video_out[0].write(frame)
     cv.imshow("OpenCV", frame)
     key_code = cv.waitKey(1) & 0xFF
     if key_code:
@@ -279,6 +314,8 @@ def main(frame_shm, debug=False):
       state_message.append("%s " % (ns.state))
     if ns.save_screenshot:
       state_message.append("💾")
+    if video_out[0]:
+      state_message.append("📹")
     texts.append(''.join(state_message))
     fps, latency = get_fps_latency()
     texts.append("FPS: %04.1f|%04.1f|%04.1f|%04.1f" % (
@@ -344,10 +381,7 @@ def main(frame_shm, debug=False):
     return fps, latency
 
   while not ns.quit:
-    if isData():
-      c = sys.stdin.read(1)
-      on_key_code(c)
-    ns.frame_event.wait(0.1)
+    ns.frame_event.wait()
     process_event_queue()
     update_info()
 
@@ -356,12 +390,14 @@ def main(frame_shm, debug=False):
         ns.quit = True
 
   for p in processes:
-    p.join(10)
+    p.join(1)
+    p.terminate()
 
 if __name__ == '__main__':
+  options = get_options()
   dsize = np.dtype(frame_buffer_dtype).itemsize * frame_buffer_size
   frame_shm = shared_memory.SharedMemory(create=True, size=dsize)
   try:
-    main(frame_shm, debug=len(sys.argv) > 1)
+    main(frame_shm, debug=options.debug)
   finally:
     frame_shm.unlink()

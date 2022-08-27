@@ -15,7 +15,7 @@ class CatCityClassifier:
   def load_model(self):
     interpreter = tf.lite.Interpreter(model_path='classifier.tflite')
     self.classifier_lite = interpreter.get_signature_runner('serving_default')
-    with open('classifier_model/class_names.json') as fp:
+    with open('class_names.json') as fp:
       self.classifier_names = json.load(fp)
 
   def predict(self, frame):
@@ -41,6 +41,12 @@ class CatCityClassifier:
 
 if __name__ == '__main__':
   classifier = CatCityClassifier()
-  frame = cv.imread('data/2022-08-11T09:50:44.247119.png')
-  ret = classifier.predict(frame)
-  print(ret)
+
+  import glob
+  import sys
+
+  for file in glob.glob(sys.argv[1] if len(sys.argv) > 1 else
+                        'data/labeled/battle_result_failed/*.png'):
+    frame = cv.imread(file)
+    ret = classifier.predict(frame)
+    print(ret)
